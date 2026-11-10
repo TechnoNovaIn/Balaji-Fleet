@@ -1,0 +1,112 @@
+{
+  "families": {
+    "truck": 2.118
+  },
+  "global": 2.192,
+  "meta": {
+    "trained_at": "2026-08-21T12:27:43.249381+00:00",
+    "days": 365,
+    "n_vehicles": 8,
+    "n_trusted": 7,
+    "n_ml_expanded": 1,
+    "old_blanket": 2.0
+  },
+  "vehicles": [
+    {
+      "vehicle_no": "KA06AD0040",
+      "family": "truck",
+      "vehicle_type": "16 W Truck",
+      "kerb": 10676.0,
+      "trailer_weight": 0,
+      "anchor_mass": 10676,
+      "raw_mass": 5294,
+      "factor": 2.017,
+      "windows": 196,
+      "empty_source": "flag"
+    },
+    {
+      "vehicle_no": "KA06AC9891",
+      "family": "truck",
+      "vehicle_type": "16 W Truck",
+      "kerb": 10676.0,
+      "trailer_weight": 0,
+      "anchor_mass": 10676,
+      "raw_mass": 6895,
+      "factor": 1.548,
+      "windows": 1046,
+      "empty_source": "flag"
+    },
+    {
+      "vehicle_no": "KA06AC9890",
+      "family": "truck",
+      "vehicle_type": "16 W Truck",
+      "kerb": 10676.0,
+      "trailer_weight": 0,
+      "anchor_mass": 10676,
+      "raw_mass": 5040,
+      "factor": 2.118,
+      "windows": 231,
+      "empty_source": "flag"
+    },
+    {
+      "vehicle_no": "KA06AC9889",
+      "family": "truck",
+      "vehicle_type": "16 W Truck",
+      "kerb": 10676.0,
+      "trailer_weight": 0,
+      "anchor_mass": 10676,
+      "raw_mass": 4611,
+      "factor": 2.315,
+      "windows": 225,
+      "empty_source": "flag"
+    },
+    {
+      "vehicle_no": "KA06AD1202",
+      "family": "truck",
+      "vehicle_type": "16 W Truck",
+      "kerb": 10676.0,
+      "trailer_weight": 0,
+      "anchor_mass": 10676,
+      "raw_mass": 5388,
+      "factor": 1.982,
+      "windows": 269,
+      "empty_source": "flag"
+    },
+    {
+      "vehicle_no": "KA06AD1203",
+      "family": "truck",
+      "vehicle_type": "16 W Truck",
+      "kerb": 10676.0,
+      "trailer_weight": 0,
+      "anchor_mass": 10676,
+      "raw_mass": 4602,
+      "factor": 2.32,
+      "windows": 250,
+      "empty_source": "flag"
+    },
+    {
+      "vehicle_no": "KA06AD1204",
+      "family": "truck",
+      "vehicle_type": "16 W Truck",
+      "kerb": 10676.0,
+      "trailer_weight": 0,
+      "anchor_mass": 10676,
+      "raw_mass": 4709,
+      "factor": 2.267,
+      "windows": 187,
+      "empty_source": "flag"
+    },
+    {
+      "vehicle_no": "KA06AD1315",
+      "family": "trailer",
+      "vehicle_type": "14 W Trailer",
+      "kerb": 11090.0,
+      "trailer_weight": 6000.0,
+      "anchor_mass": 17090,
+      "raw_mass": 6808,
+      "factor": 2.51,
+      "windows": 28,
+      "empty_source": "ml"
+    }
+  ]
+}

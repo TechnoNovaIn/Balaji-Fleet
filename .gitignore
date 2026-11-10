@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+data/
+
+# runtime logs
+*.log
+logs/
+*.pid
+*.sock
+
+# frontend
+web/node_modules/
+web/dist/
+
+# misc
+*.swp
+.idea/
+.vscode/

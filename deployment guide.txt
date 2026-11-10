@@ -1,0 +1,310 @@
+===============================================================================
+ BALAJI FLEET — LINUX DEPLOYMENT GUIDE
+ Balaji Fleet Intangles (telemetry + AI tonnage/loads dashboard)
+===============================================================================
+This guide deploys the project on a Linux server (Ubuntu/Debian shown; adjust
+package names for RHEL/Fedora). It replaces the macOS/Homebrew setup used in
+development.
+
+HARD CONSTRAINT (do not break this):
+  - Fully in-house / offline ML. NO calls to OpenAI, Anthropic or any cloud AI
+    service, at runtime or in scripts. All ML (loaded/empty classifier, payload
+    regressor, tonnage calibration, driver profiling) is LightGBM trained and
+    inferred locally. The trained model artifacts ship inside this repo under
+    models/ — no model download is required.
+  - The ONLY external integration is the Intangles OBD/GPS API (the client's
+    fleet data feed). It is a data source, not an AI service.
+
+WHAT YOU ARE DEPLOYING
+  - FastAPI backend  (app/)          : API, ingest, trips, ML inference
+  - TimescaleDB/Postgres             : telemetry + GPS hypertables + trips/shipments
+  - React (Vite) frontend (web/)     : dashboard (24h timetable, live readings,
+                                       vehicle detail, tonnage, driver profiling)
+  - Background workers               : live poller, backfill, train loop, trips loop
+                                       (managed by supervisord or systemd)
+
+------------------------------------------------------------------------------
+ 1. PREREQUISITES
+------------------------------------------------------------------------------
+  sudo apt update && sudo apt install -y \
+      git curl wget python3 python3-venv python3-pip \
+      build-essential libpq-dev \
+      postgresql postgresql-client
+  # TimescaleDB: install the package matching your PostgreSQL major version.
+  # PostgreSQL 16 example (adjust repo for your distro/version):
+  sudo apt install -y gnupg postgresql-common apt-transport-https lsb-release wget
+  sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+  sudo apt install -y postgresql-16 timescaledb-2-postgresql-16
+  # Node 20+ (for the frontend build):
+  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+  sudo apt install -y nodejs
+
+  RECOMMENDED VERSIONS (verified on the dev machine):
+    Python         3.11, 3.12 or 3.14   (pandas 3.x needs >= 3.10)
+    PostgreSQL     14+ with TimescaleDB 2.14+
+    Node           20.19+ / 22.12+      (Vite 8 requirement)
+
+------------------------------------------------------------------------------
+ 2. ENABLE TIMESCALEDB IN POSTGRESQL
+------------------------------------------------------------------------------
+  sudo -u postgres psql -c "SELECT extversion FROM pg_available_extensions WHERE name='timescaledb';"
+  # must print a version — if empty, reinstall the timescaledb package.
+
+  # Tell PostgreSQL to preload the extension:
+  sudo -u postgres psql -c "ALTER SYSTEM SET shared_preload_libraries='timescaledb';"
+  sudo systemctl restart postgresql
+
+  # Verify it loaded:
+  sudo -u postgres psql -c "SHOW shared_preload_libraries;"
+
+------------------------------------------------------------------------------
+ 3. CREATE DATABASE + USER
+------------------------------------------------------------------------------
+  sudo -u postgres psql <<'SQL'
+  CREATE ROLE balaji WITH LOGIN PASSWORD 'CHANGE_ME_STRONG';
+  CREATE DATABASE balaji OWNER balaji;
+  GRANT ALL PRIVILEGES ON DATABASE balaji TO balaji;
+SQL
+
+  # Make the role superuser-free but grant schema perms on its own DB is fine
+  # since it owns the database.
+
+  # Test local connection as the app user:
+  PGPASSWORD='CHANGE_ME_STRONG' psql -h localhost -U balaji -d balaji -c "SELECT 1;"
+
+------------------------------------------------------------------------------
+ 4. GET THE CODE
+------------------------------------------------------------------------------
+  cd /opt
+  sudo git clone <your-repo-url> balaji
+  sudo chown -R $USER:$USER /opt/balaji
+  cd /opt/balaji
+  git checkout main
+
+  The repo must contain:
+    - app/, scripts/, web/           (code)
+    - models/                        (ML artifacts — MUST be present, git-tracked)
+    - requirements.txt
+    - supervisord.conf               (process management)
+  NOTE: .env is gitignored — create it now (next step).
+
+------------------------------------------------------------------------------
+ 5. PYTHON VIRTUAL ENV + DEPENDENCIES
+------------------------------------------------------------------------------
+  cd /opt/balaji
+  python3 -m venv .venv
+  .venv/bin/pip install --upgrade pip
+
+  # Base web-server deps (from requirements.txt):
+  .venv/bin/pip install -r requirements.txt
+
+  # ML + auth + process-management deps (used by app but NOT in requirements.txt):
+  .venv/bin/pip install \
+      lightgbm scikit-learn scipy numpy pandas \
+      PyJWT bcrypt joblib supervisor
+
+  # (Optional) if you add pandas/lightgbm permanently to requirements.txt later,
+  # this extra install step disappears.
+
+  # Verify:
+  .venv/bin/python -c "import fastapi, uvicorn, psycopg, lightgbm, sklearn, jwt, bcrypt; print('deps OK')"
+
+------------------------------------------------------------------------------
+ 6. ENVIRONMENT FILE (.env)
+------------------------------------------------------------------------------
+  cd /opt/balaji
+  cat > .env <<'EOF'
+INTANGLES_BASE_URL=https://external.balajitransports.in/api
+INTANGLES_USERNAME=<Intangles username>
+INTANGLES_PASSWORD=<Intangles password>
+
+DATABASE_URL=postgresql://balaji:CHANGE_ME_STRONG@localhost:5432/balaji
+
+INGEST_BATCH_SIZE=5
+INGEST_DELAY_SECONDS=0.2
+POLL_LOOKBACK_DAYS=1
+
+JWT_SECRET=<generate a long random string, e.g.: python3 -c "import secrets;print(secrets.token_hex(32))">
+JWT_EXPIRE_MINUTES=1440
+EOF
+  chmod 600 .env
+
+  IMPORTANT: JWT_SECRET must be unique per deployment and kept private. Anyone
+  with it can mint admin tokens.
+
+------------------------------------------------------------------------------
+ 7. BUILD THE FRONTEND
+------------------------------------------------------------------------------
+  cd /opt/balaji/web
+  npm install
+  npm run build          # outputs web/dist (static files)
+
+  Two ways to serve the frontend:
+  (a) Reverse proxy (recommended): point nginx/caddy at web/dist for /
+      and proxy /api or :8000 for the backend (see section 10).
+  (b) Vite preview (dev-ish): npx vite preview --port 4173 --host 0.0.0.0
+
+  The frontend calls the API at:
+      import.meta.env.VITE_API_URL || 'http://localhost:8000'
+  For a remote UI hitting a remote API set this at build time:
+      cd /opt/balaji/web && VITE_API_URL=https://fleet.example.com npm run build
+
+------------------------------------------------------------------------------
+ 8. INITIALIZE SCHEMA + SEED DATA
+------------------------------------------------------------------------------
+  # Creates all tables, hypertables and indexes (idempotent):
+  cd /opt/balaji
+  .venv/bin/python -c "from app.db import init_schema; init_schema(); print('schema OK')"
+
+  # OPTIONAL ground-truth ingestion (training-only, NEVER displayed):
+  #   1. Client weighbridge workbook -> shipments table:
+  #      .venv/bin/python -m scripts.ingest_weighbridge --path /path/to/VehicleShipment.xlsx
+  #   2. Or from an already-generated CSV:
+  #      .venv/bin/python -m scripts.ingest_shipments
+  #   3. Vehicle list / spec sheet (kerb weights, vehicle types):
+  #      .venv/bin/python -m scripts.ingest_specs --csv data/specs.csv
+  #      .venv/bin/python -m scripts.set_kerb data/kerb.csv
+
+------------------------------------------------------------------------------
+ 9. FIRST DATA PULL (backfill history + live data)
+------------------------------------------------------------------------------
+  # Sync the vehicle list from Intangles and pull the last 365 days of OBD+GPS
+  # history. Idempotent — already-ingested (vehicle, day) pairs are skipped, so
+  # re-running is safe. 606 vehicles x 1 year is large; run in the background.
+  cd /opt/balaji
+  nohup .venv/bin/python -u -m scripts.backfill --days 365 > backfill.log 2>&1 &
+
+  # Targeted window (skip what already exists), e.g. last 6 days + today:
+  nohup .venv/bin/python -u -m scripts.backfill --days 5 --include-today > backfill_today.log 2>&1 &
+
+  # Live poller (ingests TODAY's data every 60s, 900s UTC lookback window):
+  nohup .venv/bin/python -u -m scripts.live --interval 60 --lookback-seconds 900 > live.log 2>&1 &
+
+  # Trip segmentation (recomputes last-3-days trips every 15 min so the
+  # Timetable shows trip start/end markers + load labels):
+  nohup .venv/bin/python -u -m scripts.trips_loop --interval-minutes 15 --days 3 > trips_loop.log 2>&1 &
+
+  # Self-training loop (retrains tonnage classifier/calibration, payload
+  # regressor, driver profiles every 6h and hot-reloads the API):
+  nohup .venv/bin/python -u -m scripts.train_loop --interval-hours 6 --days 365 > train.log 2>&1 &
+
+------------------------------------------------------------------------------
+ 10. RUN THE API + FRONTEND (long-running processes)
+------------------------------------------------------------------------------
+  Use supervisord (shipped config) so processes survive shell exits and
+  auto-restart on crash. Edit supervisord.conf first: all paths are absolute
+  and point at /Users/hackercode/Documents/balaji — change them to /opt/balaji.
+
+  Programs in supervisord.conf: api, live_poller, backfill, train_loop, trips_loop
+
+  Start:
+    cd /opt/balaji
+    .venv/bin/supervisord -c supervisord.conf
+    .venv/bin/supervisorctl -c supervisord.conf status          # check health
+    .venv/bin/supervisorctl -c supervisord.conf restart api     # restart one
+
+  ALTERNATIVE — systemd (preferred on a dedicated server). Create
+  /etc/systemd/system/balaji-api.service and one per worker:
+    [Unit]
+    Description=Balaji Fleet API
+    After=network.target postgresql.service
+    [Service]
+    WorkingDirectory=/opt/balaji
+    ExecStart=/opt/balaji/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+    Restart=always
+    User=balaji
+    [Install]
+    WantedBy=multi-user.target
+  Repeat for: live_poller (scripts.live), backfill (scripts.backfill --days 365),
+  train_loop (scripts.train_loop --interval-hours 6 --days 365),
+  trips_loop (scripts.trips_loop --interval-minutes 15 --days 3).
+
+------------------------------------------------------------------------------
+ 11. REVERSE PROXY (nginx) — recommended for production
+------------------------------------------------------------------------------
+  sudo apt install -y nginx
+  sudo tee /etc/nginx/sites-available/balaji > /dev/null <<'EOF'
+server {
+    listen 80;
+    server_name fleet.example.com;
+
+    # Frontend (static build)
+    root /opt/balaji/web/dist;
+    index index.html;
+    location / { try_files $uri $uri/ /index.html; }
+
+    # API
+    location /api/ {
+        proxy_pass http://127.0.0.1:8000/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+EOF
+  sudo ln -s /etc/nginx/sites-available/balaji /etc/nginx/sites-enabled/
+  sudo nginx -t && sudo systemctl reload nginx
+
+  Note: the current frontend talks to BASE = VITE_API_URL || http://localhost:8000
+  directly (no /api prefix). Either rebuild the frontend with
+  VITE_API_URL=https://fleet.example.com, or add a plain server block proxying
+  / -> backend and serving dist on a different path. Simplest for a single box:
+  serve web/dist on :80 and keep the API on :8000, setting
+  VITE_API_URL=https://fleet.example.com at build time.
+
+------------------------------------------------------------------------------
+ 12. FIRST LOGIN
+------------------------------------------------------------------------------
+  # Open http://<server>:5173 (dev) or https://fleet.example.com (prod).
+  # The first user to register becomes admin (app/auth.py). Or create one:
+  curl -s -X POST http://localhost:8000/auth/register \
+    -H "Content-Type: application/json" \
+    -d '{"username":"admin","password":"<strong-password>"}'
+
+------------------------------------------------------------------------------
+ 13. HEALTH CHECKS / VERIFICATION
+------------------------------------------------------------------------------
+  curl -s http://localhost:8000/health
+  # -> {"status":"ok","vehicles":606,"telemetry_rows":<N>,"last_telemetry":"..."}
+
+  # Data sanity:
+  /opt/balaji/.venv/bin/python - <<'PY'
+  from app.db import connect
+  with connect() as c, c.cursor() as cur:
+      for t in ("telemetry","gps_telemetry","trips","shipments","vehicles"):
+          cur.execute(f"SELECT count(*) FROM {t}")
+          print(f"{t}: {cur.fetchone()['count']}")
+PY
+
+  # Logs:
+  tail -f /opt/balaji/logs/{api,live,backfill,train,trips_loop}.log
+
+------------------------------------------------------------------------------
+ 14. MAINTENANCE NOTES
+------------------------------------------------------------------------------
+  - Restart API after a retrain if not using reload-models:
+        supervisorctl -c supervisord.conf restart api
+  - Hot-reload model artifacts without restarting:
+        curl -X POST http://localhost:8000/ingest/reload-models  (admin JWT)
+  - Tonnage batch (caches per-vehicle payload_tonnes shown in the UI):
+        .venv/bin/python -m scripts.tonnage --days 7
+  - Backfill is idempotent; re-run with a bigger --days any time to fetch
+    newly-available history. ingest_runs skips done (vehicle, day) pairs.
+  - Postgres backups (schema + data, hypertables included):
+        pg_dump -U balaji -h localhost -d balaji -Fc -f balaji.dump
+  - TimescaleDB retention: hypertables are unbounded; add drop_chunks /
+    retention policies if disk is a concern.
+
+------------------------------------------------------------------------------
+ 15. SECURITY CHECKLIST
+------------------------------------------------------------------------------
+  [ ] Strong unique JWT_SECRET in .env, chmod 600, never committed
+  [ ] Intangles creds only in .env (gitignored)
+  [ ] DATABASE_URL password not in plaintext in any committed file
+  [ ] Postgres role uses a strong password; consider binding to localhost only
+  [ ] nginx TLS (certbot) if exposed to the internet
+  [ ] First registered user is admin — register one, then create viewer users
+  [ ] No shipment/weighbridge weights are ever shown in UI/API (training-only)
+
+===============================================================================
+ END OF GUIDE
+===============================================================================
